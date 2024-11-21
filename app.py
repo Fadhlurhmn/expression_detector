@@ -1,88 +1,98 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 import cv2
 import numpy as np
+from PIL import Image, UnidentifiedImageError
+from io import BytesIO
+import base64
 from tensorflow.keras.models import load_model
-import os
+from tensorflow.keras.preprocessing.image import img_to_array
 
 app = Flask(__name__)
 
-# Load pre-trained models
+# Load pre-trained face detection model (Haar Cascade)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-expression_model = load_model('model_optimal.h5')
-expression_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
 
-UPLOAD_FOLDER = 'static/uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# Load expression detection model
+model = load_model('model_optimal.h5')  # Path to your model file
+emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']  # Update as per your model's labels
 
-# Function to detect and predict expressions
-def detect_and_predict_expression(frame):
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    results = []
+def detect_and_resize_face(image):
+    # Convert the image to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Detect faces in the image
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    
+    # If a face is found, process it
+    if len(faces) > 0:
+        # Assume we use the first detected face
+        x, y, w, h = faces[0]
+        face_region = gray[y:y+h, x:x+w]
+        
+        # Resize the face to 48x48 pixels
+        face_resized = cv2.resize(face_region, (48, 48))
+        return face_resized
+    else:
+        return None
 
-    for (x, y, w, h) in faces:
-        face_roi = gray_frame[y:y + h, x:x + w]
-        face_roi_resized = cv2.resize(face_roi, (48, 48))
-        face_roi_normalized = face_roi_resized / 255.0
-        face_roi_reshaped = np.expand_dims(face_roi_normalized, axis=(0, -1))
+def predict_expression(face_image):
+    # Preprocess the image for the model
+    face_image = face_image.astype('float32') / 255.0  # Normalize to 0-1
+    face_image = img_to_array(face_image)  # Convert to tensor
+    face_image = np.expand_dims(face_image, axis=0)  # Add batch dimension
 
-        predictions = expression_model.predict(face_roi_reshaped)
-        expression_index = np.argmax(predictions)
-        expression_label = expression_labels[expression_index]
-        confidence = predictions[0][expression_index]
+    # Predict the expression
+    predictions = model.predict(face_image)
+    predicted_label = emotion_labels[np.argmax(predictions)]
+    return predicted_label
 
-        # Draw rectangle and label
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        cv2.putText(frame, f'{expression_label} ({confidence:.2f})', (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
-        results.append({'label': expression_label, 'confidence': float(confidence), 'box': [int(x), int(y), int(w), int(h)]})
+@app.route('/face-detection', methods=['POST'])
+def face_detection():
+    # Get the image file from the request
+    file = request.files.get('image')
 
-    return frame, results
+    if file is None:
+        return jsonify({"error": "No image provided"}), 400
 
-# API for live streaming
-@app.route('/live')
-def live_feed():
-    def generate_frames():
-        cap = cv2.VideoCapture(0)
-        while True:
-            success, frame = cap.read()
-            if not success:
-                break
-            frame, _ = detect_and_predict_expression(frame)
-            _, buffer = cv2.imencode('.jpg', frame)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        cap.release()
+    try:
+        # Open the file as an image (Pillow handles various formats)
+        img = Image.open(file.stream)
+        
+        # Convert the image to a numpy array (OpenCV format)
+        img_np = np.array(img)
+        
+        # Ensure the image has 3 channels (convert grayscale to BGR if needed)
+        if len(img_np.shape) == 2:  # Grayscale image
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+        
+        # Detect and resize face
+        face = detect_and_resize_face(img_np)
 
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+        if face is None:
+            return jsonify({"error": "No face detected"}), 400
 
-# API for uploading and processing an image
-@app.route('/upload', methods=['POST'])
-def upload_image():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+        # Predict the expression
+        expression = predict_expression(face)
 
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+        # Convert the numpy array to an image for debugging or further use (optional)
+        pil_img = Image.fromarray(face)
 
-    if file:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-        file.save(filepath)
+        # Save the image to a BytesIO object
+        byte_io = BytesIO()
+        pil_img.save(byte_io, 'PNG')
+        byte_io.seek(0)
 
-        # Load and process the image
-        frame = cv2.imread(filepath)
-        frame, results = detect_and_predict_expression(frame)
-        output_path = os.path.join(app.config['UPLOAD_FOLDER'], f'processed_{file.filename}')
-        cv2.imwrite(output_path, frame)
+        # Encode the processed face as base64 (optional for debugging or returning to the client)
+        img_base64 = base64.b64encode(byte_io.read()).decode('utf-8')
 
+        # Return the expression prediction and the processed face image (optional)
         return jsonify({
-            'processed_image': output_path,
-            'results': results
-        })
+            "expression": expression,
+            "face_image": img_base64
+        }), 200
+
+    except UnidentifiedImageError:
+        return jsonify({"error": "Invalid image file"}), 400
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(debug=True)
